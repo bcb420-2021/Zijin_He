@@ -1,5 +1,4 @@
-# Welcome to my BCB420 wiki!
+# Welcome to Zijin He BCB420 wiki!
 
-
-# Journal
+You can visit my BCB420 Course journal in this repository wiki.
 
