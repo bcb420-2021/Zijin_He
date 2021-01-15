@@ -1,1 +1,5 @@
-# Zijin_He
+# Welcome to my BCB420 wiki!
+
+
+# Journal
+
