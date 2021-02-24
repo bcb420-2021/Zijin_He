@@ -1,0 +1,252 @@
+---
+title: "BCB420 Assignment 1 Data set selection and initial Processing"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Preparation
+
+Install necessay pacakges:
+```{r}
+if (! requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+
+if (! requireNamespace("GEOmetadb", quietly = TRUE)) {
+  install.packages("GEOmetadb")
+}
+
+if (! requireNamespace("GEOquery", quietly = TRUE)) {
+  install.packages("GEOquery")
+}
+
+if (! requireNamespace("edgeR", quietly = TRUE)) {
+  install.packages("edgeR")
+}
+
+if (! requireNamespace("biomaRt", quietly = TRUE)) {
+  install.packages("biomaRt")
+}
+
+library(BiocManager)
+
+library(GEOmetadb)
+
+library(GEOquery)
+
+library(edgeR)
+
+library(biomaRt)
+ 
+
+```
+
+Download GEO meta dabase and conncet to it:
+```{r}
+if(!file.exists('GEOmetadb.sqlite')){
+  getSQLiteFile()
+}
+con <- dbConnect(SQLite(),'GEOmetadb.sqlite')
+```
+
+## Part 1: Select an Expression Data Set
+
+Search datasets that are Human RNASeq Dataset, submitted within ten year and related to the keywords "ovarian".
+```{r}
+sql <- paste("SELECT DISTINCT gse.title,gse.gse, gpl.title,",
+             " gse.submission_date,",
+             " gse.supplementary_file",
+             "FROM",
+             "  gse JOIN gse_gpl ON gse_gpl.gse=gse.gse",
+             "  JOIN gpl ON gse_gpl.gpl=gpl.gpl",
+             "WHERE","  gse.submission_date > '2010-01-01' AND",
+             "  gse.title LIKE '%ovarian%' AND", 
+             "  gpl.organism LIKE '%Homo sapiens%' AND",
+             "  gpl.technology LIKE '%high-throughput sequencing%' ",
+             "  ORDER BY gse.submission_date DESC",sep=" ")
+
+rs <- dbGetQuery(con,sql)
+
+unlist(lapply(rs$supplementary_file,              FUN = function(x){x <- unlist(strsplit(x,";")) ;              x <- x[grep(x,pattern="txt",ignore.case = TRUE)];                tail(unlist(strsplit(x,"/")),n=1)})) [1:10]
+
+```
+
+I choose the data sets GSE158317. Download the data using GEOquery:
+```{r}
+sfiles = getGEOSuppFiles('GSE158317')
+fnames = rownames(sfiles)
+read_exp = read.delim(fnames[3],header=TRUE,                check.names = FALSE)
+```
+
+Assess the data:
+```{r}
+dim(read_exp)
+```
+There are 56996 Gene id and 8 samples.
+
+View the sample names by looking for column names
+```{r}
+colnames(read_exp)
+```
+According to the column names we know that there are two kinds of cell line used for the experiment : COV318 and OVCAR3, each has it control group(transfected with control miRNA) and miR-330-3p group(transfected with miR-330-3p).
+ 
+## Part 2: Clean the data and map to HUGO symbols
+
+Use the human gene ensebl dataset:
+```{r}
+ensembl <- useMart("ensembl")
+ensembl = useDataset("hsapiens_gene_ensembl",mart=ensembl)
+```
+
+
+Get a conversion stash:
+In the dataset, the ID are ensembl gene id, so the two retrieved identifiers are ensembl gene id and hgnc_symbol, the filters are ensembl gene id and the values are the ID columns of the read_exp.
+```{r}
+conversion_stash <- "exp_conversion.rds"
+if(file.exists(conversion_stash)){  
+   exp_conversion <- readRDS(conversion_stash) 
+   }else {  
+   exp_conversion <- getBM(attributes = c("ensembl_gene_id","hgnc_symbol"),                            
+                           filters = c("ensembl_gene_id"),                            
+                           values = read_exp$ID,                            
+                           mart = ensembl)  
+                           saveRDS(exp_conversion, conversion_stash)
+                           }
+```
+
+Merge the conversion and the original expression:
+```{r}
+counts_annot <- merge(exp_conversion,read_exp,by.x ='ensembl_gene_id',by.y='ID')
+```
+
+Check the ensembl gene id frequency and hugo symbol frequency and grab the id that frequency > 1:
+```{r}
+n_occur <- data.frame(table(counts_annot$ensembl_gene_id))
+hgnc_occur <- data.frame(table(counts_annot$hgnc_symbol))
+hgnc_occur <- hgnc_occur[hgnc_occur$Freq > 1,]
+n_occur <- n_occur[n_occur$Freq > 1,]
+n_occur
+```
+
+Grab the duplicate id from counts_annot and check if these duplicate ids are in duplicate hugo symbols list:
+```{r}
+dup_id_symbol <- counts_annot[counts_annot$ensembl_gene_id %in% n_occur$Var1,2]
+dup_id_symbol %in% hgnc_occur$Var1
+```
+Every id should be mapped to unique hugo symbol, since these duplicate ids are not shown in duplicate hugo symbol list, map the duplicate id to unique symbol.
+
+Change symbol to first dup's symbol:
+```{r}
+for (ID in n_occur$Var1){
+  counts_annot[counts_annot$ensembl_gene_id == ID,2]<- counts_annot[counts_annot$ensembl_gene_id == ID,2][1]
+}
+```
+
+First 5 rows of dataset after mapping:
+```{r}
+counts_annot[1:5,]
+```
+
+
+Remove low counts in counts_annot:
+```{r}
+cpms = cpm(counts_annot[,3:10])
+rownames(cpms) <- counts_annot[,1]
+keep = rowSums(cpms >1) >= 4
+count_filtered = counts_annot[keep,]
+```
+
+## Part 3: Apply Normalization
+
+Create a sample table:
+```{r}
+samples <- data.frame(matrix(ncol = 2, nrow = 8))
+rownames(samples) <- colnames(count_filtered)[3:10]
+colnames(samples) <- c("Cell line","Treatment")
+
+samples$`Cell line` <- c("COV318","COV318","COV318","OVCAR3","COV318","COV318","COV318","OVCAR3")
+samples$Treatment <- c("Control","Control","Control","Control","miR-330-3p","miR-330-3p","miR-330-3p","miR-330-3p")
+  
+```
+
+
+Create matrix for normalization:
+```{r}
+filtered_matrix <- as.matrix(count_filtered[,3:10])
+rownames(filtered_matrix) <- count_filtered$ensembl_gene_id
+d = DGEList(counts=filtered_matrix, group=samples$Treatment)
+d = calcNormFactors(d)
+normalized_counts <- cpm(d)
+normalized_data<- as.data.frame(normalized_counts)
+```
+
+Add symbol column to normalized data and reorder it:
+```{r}
+normalized_data$HUGO_symbol <- count_filtered$hgnc_symbol
+normalized_data <- normalized_data[,c(9,1,2,3,4,5,6,7,8)]
+```
+
+The first 5 rows of dataset after normalization:
+```{r}
+normalized_data[1:5,]
+```
+
+
+## Part 4: Data Interpretation
+
+1.What are the control and test conditions of the dataset?
+
+The control group is treated cell lines with control miRNA mimic, the test condition is treated cell lines with miR-330-3p.
+
+2.Why is the dataset of interest to you?
+
+This dataset can be used for exploring immnue system activation with specific subtype of ovarian cancer and prove that plasma cell could be a important target for identifying mesenchymal ovarian cancer.
+
+
+3.Were there expression values that were not unique for specific genes? How did you handle these?
+
+```{r}
+n_occur
+```
+
+There are three expression values that were not unique for specific genes.For the expression values I first check if the gene symbol of these expression values appear in the hgnc_occur, if any of them appear in the hgnc_occur, it should not be used as gene symbols. According to the above result "check if these duplicate id symbols are in duplicate hugo symbols list", the duplicate id's symbols are not shown in duplicate hugo symbols list, I directly change the duplicate id's symbol to the symbol where it appear in the data first.
+
+4.Were there expression values that could not be mapped to current HUGO symbols?
+According to the following code result, there are no ensembl gene id has missing hugo symbols.
+```{r}
+normalized_data$ensembl_gene_id[which(is.na(normalized_data$hgnc_symbol))]
+```
+
+5.How many outliers were removed?
+
+Check the numbers of id in counts_annot and count_filtered:
+```{r}
+dim(counts_annot)
+dim(count_filtered)
+```
+There are 56704-14626 = 42078 of low counts removed from the data.
+
+6.How did you handle replicates?
+I did not remove replicates in the dataset, since these replicates increases the reliability of the data and minimize the influence from experiment error.
+
+7.What is the final coverage of your dataset?
+The final expression number (after filter out low counts) of the dataset is 14626, there are 2 kinds of cell line used in the experiment, COV318(3 replicates) and OVCAR3, each of them are transfected with control miRNA and miR-330-3p
+
+
+## Reference
+
+1. Plasma cells shape the mesenchymal identity of ovarian cancers through transfer of exosome-derived microRNAs(2021)
+BY ZHENGNAN Y, WEI W.SCIENCE ADVANCES
+
+2. Immune determinants for the mesenchymal identity of ovarian cancer via exosome-mediated microRNA transfer
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE158317
+
+3. BCB420 Slides Lecture 4 -Exploring the data and basics of Normalization by Ruth Isserlin 2021-1-31
+
+4. BCB420 Slides Lecture 3 - Finding Expression DataLecture by Ruth Isserlin2021-01-24
+
+5. BCB420 Slides Lecture 5 - Data exploration and Identifier mapping by Ruth Isserlin 2021-02-07
+
+
