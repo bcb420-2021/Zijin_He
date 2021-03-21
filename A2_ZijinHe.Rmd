@@ -1,0 +1,313 @@
+---
+title: "Assignment 2: Differential Gene expression and Preliminary ORA"
+output:
+  html_document:
+    df_print: paged
+    toc: true    
+    toc_depth: 2
+bibliography: A2.bib
+---
+
+## Review from Assignemnt 1
+
+In Assignemnt 1, I select a interested gene expression dataset GSE158317, clean the data, map it to HUGO symbols and apply normalization to it. Low counts of expression are removed and this clean, normalized dataset will be used for Assignment 2.
+The dataset GSE158317 records the gene expression data from treating ovarian cancer cell line with control miRNA or miR-330-3p. It can be used for exploring immnue system activation with specific subtype of ovarian cancer and prove that plasma cell could be a important target for identifying mesenchymal ovarian cancer. [@assignment1]
+
+## Preparation
+
+Code reference: [Assignment 1](https://github.com/bcb420-2021/Zijin_He/blob/main/Assignment1Notebook.Rmd)[@assignment1]
+
+### Install necessary pacakges:
+```{r message = FALSE}
+if (! requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+
+if (! requireNamespace("GEOmetadb", quietly = TRUE)) {
+  install.packages("GEOmetadb")
+}
+
+if (! requireNamespace("GEOquery", quietly = TRUE)) {
+  install.packages("GEOquery")
+}
+
+if (! requireNamespace("edgeR", quietly = TRUE)) {
+  install.packages("edgeR")
+}
+
+if (! requireNamespace("biomaRt", quietly = TRUE)) {
+  install.packages("biomaRt")
+}
+
+if (! requireNamespace("ggplot2", quietly = TRUE)) {
+  install.packages("ggplot2")
+}
+
+if (! requireNamespace("ComplexHeatmap", quietly = TRUE)) {
+  BiocManager::install("ComplexHeatmap")
+}
+
+if (! requireNamespace("circlize", quietly = TRUE)) {
+  install.packages("circlize")
+}
+
+library(ggplot2)
+
+library(BiocManager)
+
+library(GEOmetadb)
+
+library(GEOquery)
+
+library(edgeR)
+
+library(biomaRt)
+ 
+library(ComplexHeatmap)
+
+library(circlize)
+```
+
+### Retrieve dataset from Assignment 1:
+
+Read the dataset GSE158317:
+```{r message = FALSE}
+sfiles = getGEOSuppFiles('GSE158317')
+fnames = rownames(sfiles)
+read_exp = read.delim(fnames[3],header=TRUE,                check.names = FALSE)
+```
+
+
+Map esembl id to HUGO symbols:
+```{r message = FALSE}
+ensembl <- useMart("ensembl")
+ensembl = useDataset("hsapiens_gene_ensembl",mart=ensembl)
+conversion_stash <- "exp_conversion.rds"
+if(file.exists(conversion_stash)){  
+   exp_conversion <- readRDS(conversion_stash) 
+   }else {  
+   exp_conversion <- getBM(attributes = c("ensembl_gene_id","hgnc_symbol"),                            
+                           filters = c("ensembl_gene_id"),                            
+                           values = read_exp$ID,                            
+                           mart = ensembl)  
+                           saveRDS(exp_conversion, conversion_stash)
+   }
+counts_annot <- merge(exp_conversion,read_exp,by.x ='ensembl_gene_id',by.y='ID')
+n_occur <- data.frame(table(counts_annot$ensembl_gene_id))
+hgnc_occur <- data.frame(table(counts_annot$hgnc_symbol))
+hgnc_occur <- hgnc_occur[hgnc_occur$Freq > 1,]
+n_occur <- n_occur[n_occur$Freq > 1,]
+dup_id_symbol <- counts_annot[counts_annot$ensembl_gene_id %in% n_occur$Var1,2]
+for (ID in n_occur$Var1){
+  counts_annot[counts_annot$ensembl_gene_id == ID,2]<- counts_annot[counts_annot$ensembl_gene_id == ID,2][1]
+}
+```
+
+Remove low counts:
+```{r message = FALSE}
+cpms = cpm(counts_annot[,3:10])
+rownames(cpms) <- counts_annot[,1]
+keep = rowSums(cpms >1) >= 4
+count_filtered = counts_annot[keep,]
+```
+
+Create sample table:
+```{r message = FALSE}
+samples <- data.frame(matrix(ncol = 2, nrow = 8))
+rownames(samples) <- colnames(count_filtered)[3:10]
+colnames(samples) <- c("Cell line","Treatment")
+
+samples$`Cell line` <- c("COV318","COV318","COV318","OVCAR3","COV318","COV318","COV318","OVCAR3")
+samples$Treatment <- c("Control","Control","Control","Control","miR-330-3p","miR-330-3p","miR-330-3p","miR-330-3p")
+  
+```
+
+
+Create matrix for normalization:
+```{r message = FALSE}
+filtered_matrix <- as.matrix(count_filtered[,3:10])
+rownames(filtered_matrix) <- count_filtered$ensembl_gene_id
+d = DGEList(counts=filtered_matrix, group=samples$Treatment)
+d = calcNormFactors(d)
+normalized_counts <- cpm(d)
+normalized_data<- as.data.frame(normalized_counts)
+```
+
+Add symbol column to normalized data and reorder it:
+```{r message = FALSE}
+normalized_data$HUGO_symbol <- count_filtered$hgnc_symbol
+normalized_data <- normalized_data[,c(9,1,2,3,4,5,6,7,8)]
+```
+
+Now we retrieve the result from assignment 1 as a dataframe normalized_data.
+
+
+
+## Differential Gene expression
+
+Revisit the MDS plot:
+```{r message = FALSE}
+plotMDS(d, main = "MDS plot for GSE158317 samples")
+```
+
+According to the MDS plot, the expression data from COV318 are grouped together and deviated from OVCAR. Data from OVCAR3 control and OVCAR3 miR-330-3p,are grouped on x-axis but they have a significant difference on y-value. Therefore both cell line types and miRNA treatment are important factors of building model.
+
+```{r message = FALSE}
+model_design <- model.matrix( ~ samples$Treatment + samples$`Cell line`)
+```
+
+Create a matrix and fit data to model, then compute differential expression using empircal Bayes.
+```{r}
+expressionMatrix <- as.matrix(normalized_data[,2:9])
+colnames(expressionMatrix) <- colnames(normalized_data)[2:9]
+minimalSet <- ExpressionSet(assayData=expressionMatrix)
+fit <- lmFit(minimalSet, model_design)
+fit_pat <- eBayes(fit,trend=TRUE)
+```
+
+I choose BH method for mutiple hypothesis testing since I want to reduce more false positive results.
+```{r message = FALSE}
+topfit <- topTable(fit_pat,
+                   coef=ncol(model_design),
+                   adjust.method = "BH",                   
+                   number = nrow(expressionMatrix))
+```
+
+Merge HUGO symbol to the dataframe and order the hits by p-value:
+```{r message = FALSE}
+output_hits <- merge(normalized_data[,1:2], topfit,by.y=0,by.x=0,all.y=TRUE)
+output_hits <- output_hits[order(output_hits$P.Value),]
+```
+
+Remove unnecessary column, add row names and change column name:
+```{r message = FALSE}
+output_hits = subset(output_hits, select = -c(3) )
+rownames(output_hits) <- output_hits[,1]
+names(output_hits)[names(output_hits) == "Row.names"] <- "ensembl_id"
+```
+
+Check the number of genes pass the threshold p-value < 0.05 and gene pass threshold after adjustment:
+```{r message = FALSE}
+length(which(output_hits$P.Value < 0.05))
+length(which(output_hits$adj.P.Val < 0.05))
+```
+
+Create a volcano plot, highlight the gene that pass the threshold. [@volcano]
+```{r message = FALSE}
+output_hits$diffexpressed <- "Not pass"
+output_hits$diffexpressed[output_hits$adj.P.Val < 0.05] <- "Pass threshold"
+p <- ggplot(data=output_hits, aes(x=logFC, y=-log10(adj.P.Val), col = diffexpressed)) + geom_point() + theme_minimal() + ggtitle("Volcano plot for the gene pass threshold 0.05")
+p
+```
+
+Visualize some top hits(p-value<0.001) using heatmap:
+[@circlize] [@complex]
+```{r message = FALSE}
+heatmap_matrix <- normalized_data[,2:9]
+
+top_hits <- rownames(output_hits)[output_hits$adj.P.Val                                            <0.0001]
+heatmap_matrix_tophits <- t(scale(t(heatmap_matrix[which(rownames(normalized_data) %in% top_hits),])))  
+
+heatmap_matrix_tophits<- heatmap_matrix_tophits[,       c(grep(colnames(heatmap_matrix_tophits),pattern = "\\COV"),         grep(colnames(heatmap_matrix_tophits),pattern = "\\OVCAR"))]
+
+if(min(heatmap_matrix_tophits) == 0){    
+  heatmap_col = colorRamp2(c( 0, max(heatmap_matrix_tophits)),                              c( "white", "red"))
+  } else {    
+    heatmap_col = colorRamp2(c(min(heatmap_matrix_tophits), 0,                               max(heatmap_matrix_tophits)),                              c("blue", "white", "red"))  }
+current_heatmap <- Heatmap(as.matrix(heatmap_matrix_tophits),                  cluster_rows = TRUE,  show_row_dend = TRUE,                  cluster_columns = FALSE,show_column_dend = FALSE,                  col=heatmap_col,show_column_names = TRUE,                   show_row_names = FALSE,show_heatmap_legend = TRUE,
+                           name = "Heatmap for top hits of differential expressed genes")
+current_heatmap
+```
+
+According to the heatmap of top hits, the overall gene expression from OVCAR cell line is significantly greater than the gene expression from COV318, and this may be caused by the cell line differences. There are also clusters within the group of cell lines, which may due to a condition variation.
+
+
+
+## Thresholded over-representation analysis
+
+The number of genes that are up-regulated:
+```{r message = FALSE}
+length(which(output_hits$adj.P.Val < 0.05 & output_hits$logFC > 0))
+```
+
+The number of genes that are down-regulated:
+```{r message = FALSE}
+length(which(output_hits$adj.P.Val < 0.05 & output_hits$logFC < 0))
+```
+
+Record the name of up-regulated/down-regulated/all genes for ORA.
+```{r message = FALSE}
+upregulated_genes <-output_hits$HUGO_symbol[which(output_hits$adj.P.Val < 0.05& output_hits$logFC > 0)]
+
+downregulated_genes <-output_hits$HUGO_symbol[which(output_hits$adj.P.Val < 0.05& output_hits$logFC < 0)]
+
+all_diff_genes <-output_hits$HUGO_symbol[which(output_hits$adj.P.Val < 0.05)]
+
+write.table(x=upregulated_genes,            file="ca125_upregulated_genes.txt",sep = "\t", row.names = FALSE,col.names = FALSE,quote = FALSE)
+
+write.table(x=downregulated_genes,            file="ca125_downregulated_genes.txt",sep = "\t", row.names = FALSE,col.names = FALSE,quote = FALSE)
+
+write.table(x=all_diff_genes, file="ca125_all_genes.txt",sep = "\t", row.names = FALSE,col.names = FALSE,quote = FALSE)
+```
+
+I choose to use g:profiler for over-representation analysis since it has enriched gene datasource and it has a web-server that can easily manipulate the parameter and visualize the result.
+Web-server for g:profiler: https://biit.cs.ut.ee/gprofiler/gost
+
+Parameter:
+
+* I select all of the datasource related to biological pathways since I want to know what process my over-expressed genes participated. List the datasource and their versions:
+GO:BP – annotations: BioMart
+classes: releases/2020-12-08
+KEGG – KEGG FTP Release 2020-12-14
+REAC – annotations: BioMart
+classes: 2020-12-15
+WP – 20201210
+
+* In Advanced options, choose Benjamini-Hochberg FDR in significance threshold.
+* In Advanced options, choose no evidence codes to avoid browser parsing error.
+
+Copy text from ca125_all_genes.txt to query box and click run query, click Select Ensembl id with most GO annotations when warning message comes up. Then click rerun query.
+
+![Figure 1: Run ORA in g:profiler for all differential expression gene list ](gProfiler_all.png)
+
+Copy text from ca125_down_genes.txt to query box and click run query, click Select Ensembl id with most GO annotations when warning message comes up. Then click rerun query.
+
+![Figure 2: Run ORA in g:profiler for down regulated gene list ](gProfiler_down.png)
+
+Copy text from ca125_up_genes.txt to query box and click run query, click Select Ensembl id with most GO annotations when warning message comes up. Then click rerun query.
+![Figure 3: Run ORA in g:profiler for up regulated gene list ](gProfiler_up.png)
+Figure citation: [@gprofiler]
+
+By comparing the up regulated gene ORA result and all differential expression gene result, we can discover that most of up regulated gene annotation are related to some cellular metabolic process,especially process related to transcription. They are also clustered the top it of the all differential expression gene ORA result. In down regulated gene ORA result, we can discover that these over-expression genes are included in the process like component organization and localization.
+Therefore, in the ORA result, the up regulated over-expression gene and down regulated over-expression gene show a obvious pathway tendency.
+
+
+
+## Interpretation
+According to the orignal paper of the dataset GSE158317, the treatment of miR-330-3p to the experimental cell line will increase the expression level JAM2, which is a genes encoded junctional adhesion proteins.[@original] In result of down regulated ORA, they are 4 annotation related to junctional adhesion shown in term list: "biological adhesion(GO:0022610)""cell adhesion(GO:0007155)" in GO:BP; "Cell adhesion molecules(KEGG:04514)", "Adherens junction(KEGG:04520)" in KEGG. In result of up regulated ORA, they are many transcriptionn related annotation shown in the term list, for example, the top hits from REAC. They can be considered as envidences supporting the idea that miR-330-3p is a activator of junctional adhesion molecule B(JAM2)[@dataset]. 
+
+Even though they are few articles mentioned the correlation between miR-330-3p and JAM due to lack of experimental data support, they are still many publications discuss about JAM and other mRNA, shown that JAM molecule is signifcant for the formation of blood-brain barrier(BBB) and causes a start of neurodegeneration. [@neuro] Superisingly, their are multiple neuro disease-related annotations appear in the KEGG down regulated ORA result, like "Pathways of neurodegeneration - multiple diseases(KEGG:05022)". This envidence cannot directly prove that miR-330-3p is related to JAM expression, but it provides a reseanable explaination why neuro-related pathway shown in the result of ORA.
+
+
+## Reference
+
+  Martin Morgan (2019). BiocManager: Access the Bioconductor Project Package Repository. R package     version 1.30.10. https://CRAN.R-project.org/package=BiocManager
+  
+  Davis, S. and Meltzer, P. S. GEOquery: a bridge between the Gene Expression Omnibus (GEO)
+  
+  H. Wickham. ggplot2: Elegant Graphics for Data Analysis. Springer-Verlag New York, 2016.
+  and BioConductor. Bioinformatics, 2007, 14, 1846-1847
+  
+  BCB420 Slides Lecture 3 - Finding Expression DataLecture by Ruth Isserlin2021-01-24
+  
+  BCB420 Slides Lecture 4 -Exploring the data and basics of Normalization by Ruth Isserlin 2021-1-31
+  
+  BCB420 Slides Lecture 5 - Data exploration and Identifier mapping by Ruth Isserlin 2021-02-07
+  
+  BCB420 Slides Lecture 6 - Differential gene expression analysis by Ruth Isserlin 2021
+  
+  BCB420 Slides Lecture 7 - Annotation Resources and Simple Enrichment by Ruth Isserlin 2021
+
+  
+  
